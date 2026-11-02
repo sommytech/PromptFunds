@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/34295360/README.md)
 # Infinite Cooperative Platform
 
 Mobile-first savings and lending platform for a cooperative: free registration, KYC, ledger-backed savings wallet, deposits, admin-approved withdrawals, daily interest, and (Phase 2) loans.
