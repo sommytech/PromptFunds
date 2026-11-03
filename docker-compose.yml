@@ -1,25 +1,17 @@
 services:
   db:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: coop
-      POSTGRES_PASSWORD: coop
-      POSTGRES_DB: coop
+    image: postgres:16
+    environment: { POSTGRES_USER: pf, POSTGRES_PASSWORD: pf, POSTGRES_DB: promptfunds }
     volumes: [pgdata:/var/lib/postgresql/data]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U coop"]
-      interval: 5s
-      retries: 10
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U pf"], interval: 5s, retries: 10 }
     ports: ["5432:5432"]
-
   app:
     build: .
-    depends_on:
-      db: { condition: service_healthy }
+    depends_on: { db: { condition: service_healthy } }
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://coop:coop@db:5432/coop
+      DATABASE_URL: postgresql://pf:pf@db:5432/promptfunds
+      DIRECT_URL: postgresql://pf:pf@db:5432/promptfunds
     ports: ["3000:3000"]
-
 volumes:
   pgdata:

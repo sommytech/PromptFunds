@@ -1,0 +1,31 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: pf, POSTGRES_PASSWORD: pf, POSTGRES_DB: promptfunds }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pf" --health-interval 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://pf:pf@localhost:5432/promptfunds
+      DIRECT_URL: postgresql://pf:pf@localhost:5432/promptfunds
+      FIELD_ENCRYPTION_KEY: q3J8m0yS2d6ZbF0xk4m7Q9T1sV5wY8zA2cE4gH6jK8M=
+      IDENTITY_HASH_SECRET: ci
+      DEMO_MODE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx prisma migrate deploy
+      - run: npm run db:seed
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

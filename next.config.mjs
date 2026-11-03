@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "standalone",
+  // "standalone" is for the Docker image; Netlify's Next.js runtime ignores it.
+  output: process.env.NETLIFY ? undefined : "standalone",
   poweredByHeader: false,
   async headers() {
     return [

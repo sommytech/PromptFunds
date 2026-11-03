@@ -1,50 +1,87 @@
-# Infinite Cooperative Platform
+# Prompt Funds
 
-Mobile-first savings and lending platform for a cooperative: free registration, KYC, ledger-backed savings wallet, deposits, admin-approved withdrawals, daily interest, and (Phase 2) loans.
+Mobile-first **member savings wallet + digital lending** platform for cooperatives. Members join free, verify with BVN, save any amount into a personal deposit account, earn daily-accrued interest, withdraw to their own bank account, and apply for, accept and repay loans — without visiting an office.
 
-> **Compliance note:** the cooperative's licence covers lending, not transaction services. This codebase deliberately has **no** member-to-member or third-party transfers; payouts go only to the member's verified own bank account. Get written legal/regulatory confirmation before accepting savings or paying withdrawals.
+> **Licence boundary.** The operator is licensed to lend, not to provide payment/transfer services. There are **no** member-to-member, third-party or inter-bank transfer features. Withdrawals and loan disbursements go **only** to the member's own, name-verified bank account. Confirm legal/regulatory arrangements (cooperative registration, lending licence, FCCPC digital-lending registration, NDPA 2023) before accepting savings or lending.
+
+## What's inside
+
+| Area | Features |
+|---|---|
+| Public site | Home, Savings, Loans (live calculator), About, FAQ, Register, Log in |
+| Member portal | KYC (BVN + own-account name check), dashboard, savings wallet, deposit account, withdrawals, history + CSV statement, loans (apply → offer → repay), profile, notifications |
+| Savings engine | Double-entry ledger, signed + re-verified deposit webhooks (idempotent), maker-checker withdrawals, daily interest accrual + month-end credit |
+| Lending engine | Products (reducing/flat), automated credit checks, officer assessment → committee approval (different people) → member acceptance → finance disbursement, schedules, repay from savings, nightly auto-debit, arrears |
+| Admin portal | KPIs (liquidity cover, PAR, trial balance), member search + KYC queue, withdrawal queue, loan pipeline, reports (trial balance, income/expense, ageing), operations (jobs), hash-chained audit trail |
+| Docs | `docs/` — pitch deck, cost & support proposal, PRD, TRD, app flow, UI/UX brief, backend schema, implementation plan (Markdown + PDF) |
 
 ## Stack
-Next.js 14 (App Router) · React · TypeScript · Tailwind · PostgreSQL · Prisma · Zod · argon2 · Vitest · Docker
 
-## Quick start
+Next.js 14 (App Router, React Server Components, server actions) · TypeScript · Tailwind · PostgreSQL 16 · **Prisma 7 (Rust-free client + `pg` adapter — no native binaries, ideal for Netlify Functions)** · Zod · scrypt · AES-256-GCM field encryption · Vitest · Netlify (or Docker).
+
+## Deploy to Netlify (recommended)
+
+1. **Database:** easiest is Netlify DB (Site → Extensions → Neon) which sets `NETLIFY_DATABASE_URL` / `NETLIFY_DATABASE_URL_UNPOOLED` automatically — the app reads those. Or create Postgres on [Neon](https://neon.tech) yourself and set `DATABASE_URL` (pooled) and `DIRECT_URL` (direct).
+2. **Import the repo** in Netlify → *Add new site → Import from Git → GitHub → PromptFunds*. `netlify.toml` already sets the build command (`npm run netlify:build` = generate → migrate → seed → build) and the Next.js runtime.
+3. **Environment variables** (Site settings → Environment variables):
+
+   | Variable | Value |
+   |---|---|
+   | `DATABASE_URL` | Neon pooled URL (`...-pooler...?sslmode=require`) |
+   | `DIRECT_URL` | Neon direct URL |
+   | `FIELD_ENCRYPTION_KEY` | `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` |
+   | `IDENTITY_HASH_SECRET` | any long random string |
+   | `CRON_SECRET` | any long random string |
+   | `SEED_ADMIN_PASSWORD` | initial password for staff accounts |
+   | `DEMO_MODE` | `true` for a sandbox demo (sandbox deposits + demo logins), `false` for real money |
+   | `PAYMENT_PROVIDER` / `PAYSTACK_SECRET_KEY` | `mock` for demo, `paystack` + key for live |
+   | `KYC_PROVIDER` / `DOJAH_APP_ID` / `DOJAH_SECRET_KEY` | `mock` for demo, `dojah` + keys for live |
+   | `KYC_AUTO_APPROVE` | `true` to approve automatically on a full BVN match |
+
+4. **Deploy.** The nightly scheduled function (`netlify/functions/cron.mts`) runs interest accrual, auto-debit/arrears and month-end interest credit.
+5. **Live payments:** set the Paystack webhook URL to `https://<your-site>/api/webhooks/paystack`.
+
+**Demo logins** (when `DEMO_MODE=true`; password = `SEED_ADMIN_PASSWORD`, default `ChangeMe-Now-12345`): member `ada@promptfunds.demo`; staff `admin@`, `kyc@`, `loans@`, `committee@`, `finance@`, `approver@`, `auditor@promptfunds.local`. **Change all passwords and set `DEMO_MODE=false` before handling real money.**
+
+## Run locally
+
 ```bash
-cp .env.example .env            # set SESSION_SECRET and PAYMENT_WEBHOOK_SECRET
-docker compose up -d db
-npm install
-npx prisma migrate dev --name init   # or: npx prisma db push
-psql "$DATABASE_URL" -f prisma/sql/ledger_constraints.sql
-psql "$DATABASE_URL" -f prisma/sql/search_indexes.sql
+cp .env.example .env            # set DATABASE_URL / DIRECT_URL, DEMO_MODE=true
+docker compose up -d db         # or any local Postgres 16
+npm install                     # runs prisma generate
+npx prisma migrate deploy
 npm run db:seed
 npm run dev                     # http://localhost:3000
-npm test
+npm test                        # unit tests
 ```
-Full containerised run: `docker compose up --build` (then run migrations and the SQL files against the db).
 
-## Deposit webhook (local test)
+Jobs from the CLI: `npm run job:accrue`, `npm run job:arrears`, `npm run job:credit` (also on Admin → Operations).
+
+Test a signed deposit webhook (mock provider):
+
 ```bash
-BODY='{"event":"deposit.confirmed","reference":"TEST-0001","accountNumber":"<member virtual acct>","amountKobo":"500000"}'
+BODY='{"event":"deposit.confirmed","reference":"TEST-0001","accountNumber":"<member deposit acct>","amountKobo":"500000"}'
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$PAYMENT_WEBHOOK_SECRET" | awk '{print $2}')
-curl -X POST localhost:3000/api/webhooks/payments -H "x-signature: $SIG" -d "$BODY"
-```
-Replaying the same `reference` is a no-op (idempotent).
-
-## Interest jobs
-```bash
-npm run job:interest            # daily accrual (schedule at 00:30)
-npx tsx src/jobs/interest.ts credit   # month-end credit
+curl -X POST localhost:3000/api/webhooks/payments -H "x-signature: $SIG" -d "$BODY"   # replay = no-op
 ```
 
-## Layout
-- `docs/` — pitch deck, cost proposal, PRD, TRD, app flow, UI/UX brief, backend schema, implementation plan
-- `prisma/schema.prisma` — data model; `prisma/sql/` — ledger triggers, search indexes
-- `src/lib/` — money, ledger, interest, amortisation, auth, audit, payment adapter
-- `src/services/` — members/KYC, deposits, withdrawals
-- `src/app/` — pages and API routes
+## Project layout
 
-## Status: starter, not production-ready
-Implemented: registration, sessions, KYC approval flow, ledger, deposits via webhook, withdrawal request/approval with maker-checker and payout adapter, interest accrual/credit, loan schedule maths, member dashboard, admin overview.
-Still to build before launch: KYC document upload and provider integration, OTP delivery, MFA for staff, loan application/approval/repayment endpoints and UI, reconciliation job, statements/exports, notifications, rate limiting, real payment provider adapter, security review and penetration test.
+```
+prisma/schema.prisma, migrations/, seed.ts   data model, SQL migrations (incl. ledger triggers), idempotent seed
+src/app/(public) (member) admin api _actions  pages, API routes, server actions
+src/services/                                members, deposits, withdrawals, interest, loans, notify
+src/lib/                                     ledger, money, interest, amortisation, password, crypto, audit, auth, policy, providers/
+netlify.toml, netlify/functions/cron.mts     Netlify build + scheduled jobs
+docs/                                        8 project documents (Markdown + PDF)
+```
 
-## Deploy
-Any container host (Render, Fly.io, Railway, AWS ECS, Azure Container Apps) with managed PostgreSQL. Set env vars from `.env.example`, run `npx prisma migrate deploy`, apply `prisma/sql/*.sql`, seed, and point the payment provider webhook to `/api/webhooks/payments`. Use `/api/health` for health checks.
+## Verified
+
+- `tsc` clean, 14 unit tests (money, interest, schedules, due dates, crypto, passwords).
+- Browser end-to-end run: register → KYC → officer approval → sandbox + signed-webhook deposits (replay ignored, bad signature rejected) → parallel withdrawals (no overdraw) → finance approval → loan apply → assess → committee approve → accept → disburse → repay → accrual/arrears/credit jobs → CSV statement. Trial balance ₦0.00; wallets match ledger; ledger UPDATE blocked by trigger.
+- Arrears path: auto-debit, overdue flag, withdrawal block while in arrears, recovery after top-up; self-approval and wrong-role approval refused.
+
+## Before go-live (see docs/08)
+
+Staff TOTP MFA · rate limiting (Upstash) · CSP header · SMS/email delivery (Termii/Resend) · settlement-file reconciliation UI · payout-account change workflow · penetration test · replace placeholder rates with board-approved policy.

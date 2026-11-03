@@ -1,0 +1,536 @@
+// Prompt Funds — PostgreSQL schema (Prisma)
+// All money is stored as BigInt kobo. Ledger tables are append-only.
+
+// Prisma 7 Rust-free client: pure TypeScript + WASM query compiler, talks to Postgres via the pg driver adapter.
+// No native engine binaries, so it bundles cleanly into Netlify Functions / AWS Lambda.
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Connection URLs live in prisma.config.ts (migrations) and src/lib/db.ts (runtime).
+}
+
+enum Role {
+  MEMBER
+  KYC_OFFICER
+  FINANCE_OFFICER
+  FINANCE_APPROVER
+  LOAN_OFFICER
+  COMMITTEE
+  ADMIN
+  AUDITOR
+}
+
+enum KycStatus {
+  NOT_STARTED
+  SUBMITTED
+  IN_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  INCOME
+  EXPENSE
+  EQUITY
+}
+
+enum TxType {
+  DEPOSIT
+  WITHDRAWAL
+  INTEREST_CREDIT
+  LOAN_DISBURSEMENT
+  LOAN_REPAYMENT
+  FEE
+  ADJUSTMENT
+  REVERSAL
+}
+
+enum TxStatus {
+  PENDING
+  RECONCILED
+  POSTED
+  FAILED
+  REVERSED
+}
+
+enum WithdrawalStatus {
+  PENDING_APPROVAL
+  APPROVED
+  PROCESSING
+  PAID
+  REJECTED
+  FAILED
+  CANCELLED
+}
+
+enum LoanStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_ASSESSMENT
+  APPROVED
+  DECLINED
+  OFFER_ACCEPTED
+  DISBURSED
+  ACTIVE
+  IN_ARREARS
+  CLOSED
+  WRITTEN_OFF
+}
+
+enum InstalmentStatus {
+  DUE
+  PAID
+  PARTIAL
+  OVERDUE
+}
+
+enum InterestMethod {
+  REDUCING_BALANCE
+  FLAT
+}
+
+model User {
+  id               String      @id @default(cuid())
+  email            String      @unique
+  phone            String      @unique
+  passwordHash     String
+  role             Role        @default(MEMBER)
+  status           UserStatus  @default(PENDING)
+  mfaSecret        String?
+  failedLogins     Int         @default(0)
+  lockedUntil      DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  member           Member?
+  sessions         Session[]
+  auditLogs        AuditLog[]
+
+  @@index([role, status])
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  ip         String?
+  userAgent  String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model OtpCode {
+  id        String   @id @default(cuid())
+  target    String
+  codeHash  String
+  purpose   String
+  attempts  Int      @default(0)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([target, purpose])
+}
+
+model Member {
+  id               String     @id @default(cuid())
+  userId           String     @unique
+  membershipNumber String?    @unique // IC-YYYY-NNNNNN, issued on approval
+  firstName        String
+  lastName         String
+  dateOfBirth      DateTime?
+  address          String?
+  bvnEncrypted     String?
+  bvnHash          String?    @unique // HMAC of BVN: blocks duplicate identities without decrypting
+  ninEncrypted     String?
+  kycStatus        KycStatus  @default(NOT_STARTED)
+  kycReviewedBy    String?
+  kycReviewedAt    DateTime?
+  kycRejectReason  String?
+  kycProviderRef   String?
+  kycMatchScore    Int?
+  searchText       String     @default("") // lowercase name + number + phone for search
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  user             User       @relation(fields: [userId], references: [id])
+  kycDocuments     KycDocument[]
+  bankAccount      BankAccount?
+  wallet           Wallet?
+  virtualAccount   VirtualAccount?
+  deposits         Deposit[]
+  withdrawals      Withdrawal[]
+  loans            Loan[]
+  notifications    Notification[]
+
+  @@index([kycStatus])
+  @@index([searchText])
+  @@index([lastName, firstName])
+}
+
+model KycDocument {
+  id         String   @id @default(cuid())
+  memberId   String
+  type       String // ID_CARD, SELFIE, PROOF_OF_ADDRESS
+  storageKey String
+  createdAt  DateTime @default(now())
+  member     Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([memberId])
+}
+
+// One verified payout account per member. Payouts go ONLY here.
+model BankAccount {
+  id            String   @id @default(cuid())
+  memberId      String   @unique
+  bankCode      String
+  accountNumber String
+  accountName   String
+  bankName      String   @default("")
+  recipientCode String?  // payment provider transfer recipient
+  nameMatched   Boolean  @default(false)
+  verifiedAt    DateTime?
+  createdAt     DateTime @default(now())
+  member        Member   @relation(fields: [memberId], references: [id])
+}
+
+model VirtualAccount {
+  id            String   @id @default(cuid())
+  memberId      String   @unique
+  provider      String
+  providerCustomerRef String?
+  bankName      String
+  accountNumber String   @unique
+  accountName   String
+  createdAt     DateTime @default(now())
+  member        Member   @relation(fields: [memberId], references: [id])
+}
+
+// Cached balances; ledger remains the source of truth and is verified nightly.
+model Wallet {
+  id               String   @id @default(cuid())
+  memberId         String   @unique
+  ledgerAccountId  String   @unique
+  balanceKobo      BigInt   @default(0) // total savings
+  heldKobo         BigInt   @default(0) // pending withdrawals / liens
+  interestEarnedKobo BigInt @default(0)
+  totalDepositsKobo  BigInt @default(0)
+  totalWithdrawalsKobo BigInt @default(0)
+  version          Int      @default(0) // optimistic concurrency
+  updatedAt        DateTime @updatedAt
+
+  member           Member        @relation(fields: [memberId], references: [id])
+  ledgerAccount    LedgerAccount @relation(fields: [ledgerAccountId], references: [id])
+}
+
+model LedgerAccount {
+  id        String      @id @default(cuid())
+  code      String      @unique // e.g. 1000-BANK-COLL, 2000-MEMBER-<id>
+  name      String
+  type      AccountType
+  memberId  String?     // set for per-member liability sub-accounts
+  createdAt DateTime    @default(now())
+
+  lines     LedgerLine[]
+  wallet    Wallet?
+
+  @@index([type])
+  @@index([memberId])
+}
+
+model LedgerEntry {
+  id             String   @id @default(cuid())
+  idempotencyKey String   @unique
+  txType         TxType
+  reference      String   @unique
+  description    String
+  postedAt       DateTime @default(now())
+  reversalOfId   String?  @unique
+  createdBy      String?
+
+  lines          LedgerLine[]
+  transaction    Transaction?
+
+  @@index([postedAt])
+  @@index([txType])
+}
+
+model LedgerLine {
+  id        String   @id @default(cuid())
+  entryId   String
+  accountId String
+  debit     BigInt   @default(0)
+  credit    BigInt   @default(0)
+
+  entry     LedgerEntry   @relation(fields: [entryId], references: [id])
+  account   LedgerAccount @relation(fields: [accountId], references: [id])
+
+  @@index([accountId])
+  @@index([entryId])
+}
+
+// Member-facing transaction record (history, pending items)
+model Transaction {
+  id          String   @id @default(cuid())
+  memberId    String
+  type        TxType
+  status      TxStatus @default(PENDING)
+  amountKobo  BigInt
+  reference   String   @unique
+  narration   String?
+  entryId     String?  @unique
+  createdAt   DateTime @default(now())
+  settledAt   DateTime?
+
+  entry       LedgerEntry? @relation(fields: [entryId], references: [id])
+
+  @@index([memberId, createdAt(sort: Desc)])
+  @@index([status])
+  @@index([type, createdAt])
+}
+
+model Deposit {
+  id                String   @id @default(cuid())
+  memberId          String
+  providerReference String   @unique
+  amountKobo        BigInt
+  channel           String
+  status            TxStatus @default(PENDING)
+  rawPayload        Json?
+  reconciledAt      DateTime?
+  createdAt         DateTime @default(now())
+
+  member            Member   @relation(fields: [memberId], references: [id])
+
+  @@index([memberId, createdAt])
+  @@index([status])
+}
+
+model Withdrawal {
+  id            String           @id @default(cuid())
+  memberId      String
+  amountKobo    BigInt
+  status        WithdrawalStatus @default(PENDING_APPROVAL)
+  idempotencyKey String          @unique
+  requestedAt   DateTime         @default(now())
+  makerId       String?
+  checkerId     String?
+  approvedAt    DateTime?
+  paidAt        DateTime?
+  payoutRef     String?          @unique
+  failureReason String?
+  updatedAt     DateTime         @default(now()) @updatedAt
+
+  member        Member           @relation(fields: [memberId], references: [id])
+
+  @@index([memberId, requestedAt])
+  @@index([status])
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+}
+
+model InterestPolicy {
+  id            String   @id @default(cuid())
+  annualRateBps Int      // basis points, e.g. 700 = 7.00%
+  dayCount      Int      @default(365)
+  minBalanceKobo BigInt  @default(0)
+  effectiveFrom DateTime
+  approvedBy    String?
+  createdAt     DateTime @default(now())
+
+  @@index([effectiveFrom])
+}
+
+model InterestAccrual {
+  id         String   @id @default(cuid())
+  memberId   String
+  accrualDate DateTime @db.Date
+  balanceKobo BigInt
+  accruedMicroKobo BigInt // kobo * 1e6 to avoid rounding loss
+  creditedEntryId String?
+  createdAt  DateTime @default(now())
+
+  @@unique([memberId, accrualDate])
+  @@index([memberId, creditedEntryId])
+}
+
+model LoanProduct {
+  id              String         @id @default(cuid())
+  name            String
+  minAmountKobo   BigInt
+  maxAmountKobo   BigInt
+  minTenorMonths  Int
+  maxTenorMonths  Int
+  annualRateBps   Int
+  method          InterestMethod @default(REDUCING_BALANCE)
+  processingFeeBps Int           @default(0)
+  active          Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+
+  loans           Loan[]
+}
+
+model Loan {
+  id               String      @id @default(cuid())
+  reference        String      @unique // PF-LN-XXXXXX shown to members
+  memberId         String
+  productId        String
+  principalKobo    BigInt
+  tenorMonths      Int
+  annualRateBps    Int
+  purpose          String
+  monthlyIncomeKobo BigInt?
+  monthlyExpensesKobo BigInt?
+  status           LoanStatus  @default(DRAFT)
+  method           InterestMethod @default(REDUCING_BALANCE)
+  processingFeeKobo BigInt     @default(0)
+  totalInterestKobo BigInt     @default(0)
+  instalmentKobo   BigInt      @default(0)
+  affordabilityBps Int?        // instalment / disposable income, basis points
+  declineReason    String?
+  disbursedBy      String?
+  payoutRef        String?     @unique
+  assessedBy       String?
+  assessmentNotes  String?
+  approvedBy       String?
+  approvedAt       DateTime?
+  acceptedAt       DateTime?
+  disbursedAt      DateTime?
+  disbursementEntryId String?  @unique
+  outstandingPrincipalKobo BigInt @default(0)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  member           Member      @relation(fields: [memberId], references: [id])
+  product          LoanProduct @relation(fields: [productId], references: [id])
+  instalments      LoanInstalment[]
+  repayments       LoanRepayment[]
+
+  @@index([memberId, status])
+  @@index([status])
+}
+
+model LoanInstalment {
+  id            String           @id @default(cuid())
+  loanId        String
+  number        Int
+  dueDate       DateTime         @db.Date
+  principalKobo BigInt
+  interestKobo  BigInt
+  paidKobo      BigInt           @default(0)
+  status        InstalmentStatus @default(DUE)
+  daysOverdue   Int              @default(0)
+
+  loan          Loan             @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  @@unique([loanId, number])
+  @@index([dueDate, status])
+}
+
+model LoanRepayment {
+  id         String   @id @default(cuid())
+  loanId     String
+  amountKobo BigInt
+  principalKobo BigInt @default(0)
+  interestKobo  BigInt @default(0)
+  source     String   @default("WALLET") // WALLET | AUTO_DEBIT | BANK_TRANSFER
+  entryId    String?  @unique
+  paidAt     DateTime @default(now())
+
+  loan       Loan     @relation(fields: [loanId], references: [id])
+
+  @@index([loanId])
+}
+
+model ReconciliationRun {
+  id          String   @id @default(cuid())
+  runDate     DateTime @db.Date
+  matched     Int      @default(0)
+  unmatched   Int      @default(0)
+  varianceKobo BigInt  @default(0)
+  createdAt   DateTime @default(now())
+
+  items       ReconciliationItem[]
+
+  @@index([runDate])
+}
+
+model ReconciliationItem {
+  id          String   @id @default(cuid())
+  runId       String
+  reference   String
+  providerKobo BigInt
+  ledgerKobo  BigInt?
+  resolved    Boolean  @default(false)
+  resolvedBy  String?
+  note        String?
+
+  run         ReconciliationRun @relation(fields: [runId], references: [id])
+
+  @@index([runId, resolved])
+  @@index([reference])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  memberId  String
+  channel   String
+  subject   String
+  body      String
+  sentAt    DateTime?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  member    Member   @relation(fields: [memberId], references: [id])
+
+  @@index([memberId, createdAt])
+}
+
+// Hash-chained audit log: each row stores the hash of the previous row.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  prevHash   String?
+  hash       String
+  createdAt  DateTime @default(now())
+
+  actor      User?    @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+}
+
+model MembershipCounter {
+  year  Int @id
+  value Int @default(0)
+}

@@ -1,23 +1,21 @@
-FROM node:20-bookworm-slim AS deps
+# Container deployment (Render, Railway, Fly.io, AWS ECS, Azure Container Apps).
+FROM node:22-bookworm-slim AS deps
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends openssl python3 make g++ && rm -rf /var/lib/apt/lists/*
-COPY package.json package-lock.json* ./
-RUN npm ci || npm install
+COPY package.json package-lock.json* prisma.config.ts ./
+COPY prisma ./prisma
+RUN npm ci
 
 FROM deps AS build
 COPY . .
-RUN npx prisma generate && npm run build
+RUN npm run build
 
-FROM node:20-bookworm-slim AS run
+FROM node:22-bookworm-slim AS run
 WORKDIR /app
 ENV NODE_ENV=production
-RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/.next/standalone ./
 COPY --from=build /app/.next/static ./.next/static
-COPY --from=build /app/prisma ./prisma
-COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
-COPY --from=build /app/node_modules/prisma ./node_modules/prisma
+COPY --from=build /app/public ./public
 USER node
 EXPOSE 3000
+# Run migrations as a release step: `npx prisma migrate deploy && npm run db:seed`
 CMD ["node", "server.js"]
